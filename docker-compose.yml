@@ -12,7 +12,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    ports: ["5432:5432"]   # optional; remove if you don't need host access
+    # optional on Windows host; keep if you want local psql access:
+    ports: ["5432:5432"]
 
   migrate:
     image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
@@ -51,10 +52,16 @@ services:
       APIKEY_ENABLED: "1"
       API_KEYS: secret123
       DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/market_edge
-    command: >
+    command: >-
       uvicorn main1:app --host 0.0.0.0 --port 8010
     ports: ["8010:8010"]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8010/health >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
 
 volumes:
   mep_db_data:
