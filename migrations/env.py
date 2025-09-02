@@ -10,7 +10,7 @@ config = context.config
 # Safe sync URL (avoid turning psycopg2 -> psycopg22)
 url = os.getenv(
     "DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/market_edge",
+    "postgresql+psycopg2://postgres:postgres@db:5432/market_edge",
 )
 if "+asyncpg" in url:
     url = url.replace("+asyncpg", "+psycopg2")
