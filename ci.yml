@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BASE: http://127.0.0.1:8010
+      BASE_URL: http://127.0.0.1:8010
+      GOOD: secret123
+      APIKEY_ENABLED: "1"
+      API_KEYS: secret123
+      RATE_LIMIT_RPS: "1000"
+      RATE_LIMIT_BURST: "2000"
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/market_edge
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements-test.txt ]; then pip install -r requirements-test.txt; fi
+          pip install pytest httpx
+
+      - name: Build images
+        run: docker compose build --no-cache
+
+      - name: Start stack
+        run: docker compose up -d
+
+      - name: Wait for app health
+        run: |
+          bash scripts/wait_for_http.sh http://127.0.0.1:8010/health 60
+
+      - name: Sanity checks
+        run: |
+          curl -fsS $BASE/health
+          curl -fsS $BASE/metrics | grep -i process_max_fds
+
+      - name: Run smoke tests
+        run: pytest -q -k "smoke_endpoints or http" -s
+
+      - name: Dump app logs on failure
+        if: failure()
+        run: docker logs mep-app --tail=400 || true
