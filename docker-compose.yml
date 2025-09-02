@@ -12,24 +12,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    ports: ["5432:5432"]
-
-  app:
-    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
-    container_name: mep-app
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      APIKEY_ENABLED: "1"
-      API_KEYS: "secret123"
-      DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
-    command: >
-      uvicorn main1:app
-      --host 0.0.0.0
-      --port 8010
-    ports: ["8010:8010"]
-    restart: unless-stopped
+    ports: ["5432:5432"]   # optional; remove if you don't need host access
 
   migrate:
     image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
@@ -38,7 +21,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/market_edge
     command: ["sh","-lc","alembic upgrade head || true"]
     volumes:
       - ./alembic:/app/alembic:ro
@@ -54,6 +37,24 @@ services:
       - ./seeds:/seeds:ro
     command: ["sh","-lc","psql postgresql://postgres:postgres@db:5432/market_edge -f /seeds/ohlcv_seed.sql || true"]
 
+  app:
+    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
+    container_name: mep-app
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      seed:
+        condition: service_completed_successfully
+    environment:
+      APIKEY_ENABLED: "1"
+      API_KEYS: secret123
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/market_edge
+    command: >
+      uvicorn main1:app --host 0.0.0.0 --port 8010
+    ports: ["8010:8010"]
+    restart: unless-stopped
+
 volumes:
   mep_db_data:
-
