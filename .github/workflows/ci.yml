@@ -1,0 +1,29 @@
+name: CI
+on: [push, pull_request]
+concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13", cache: "pip" }
+      - run: |
+          python -V
+          pip install -r requirements.txt pytest httpx
+      - run: |
+          docker compose up -d --build
+          for i in {1..60}; do curl -fsS http://127.0.0.1:8010/health && break; sleep 2; done
+          curl -fsS http://127.0.0.1:8010/health
+      - env:
+          BASE: http://127.0.0.1:8010
+          BASE_URL: http://127.0.0.1:8010
+          GOOD: secret123
+        run: pytest -q -k "smoke_endpoints or http" -s
+      - if: failure()
+        run: |
+          docker ps -a
+          docker logs mep-app || true
+          docker logs mep-db || true
+          docker logs mep-migrate || true
+          docker logs mep-seed || true
