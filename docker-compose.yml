@@ -27,7 +27,7 @@ services:
       APIKEY_ENABLED: "1"
       API_KEYS: "secret123"
       # make webhook public (no API key required)
-      APIKEY_PUBLIC: "/stripe/webhook"
+      APIKEY_PUBLIC: "/docs,/openapi.json,/health,/healthz,/ready,/readyz,/metrics,/stripe/webhook"
       # DB (service hostname is 'db')
       DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
       # optional: if you set a real Stripe signing secret later
