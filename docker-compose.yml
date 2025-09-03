@@ -13,8 +13,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    ports:
-      - "5432:5432"
+    ports: ["5432:5432"]
 
   app:
     image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
@@ -23,21 +22,14 @@ services:
       db:
         condition: service_healthy
     environment:
-      # API key system
+      # ✅ correct names + webhook public
       APIKEY_ENABLED: "1"
       API_KEYS: "secret123"
-      # make webhook public (no API key required)
       APIKEY_PUBLIC: "/docs,/openapi.json,/health,/healthz,/ready,/readyz,/metrics,/stripe/webhook"
-      # DB (service hostname is 'db')
       DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
-      # optional: if you set a real Stripe signing secret later
-      # STRIPE_WEBHOOK_SECRET: "whsec_xxx"
     command: >
-      uvicorn main1:app
-      --host 0.0.0.0
-      --port 8010
-    ports:
-      - "8010:8010"
+      uvicorn main1:app --host 0.0.0.0 --port 8010
+    ports: ["8010:8010"]
     restart: unless-stopped
 
   migrate:
@@ -48,11 +40,10 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
-    # use YOUR local migrations + ini (so env.py honors DATABASE_URL)
-    volumes:
-      - ./migrations:/app/migrations:ro
-      - ./alembic.ini:/app/alembic.ini:ro
     command: ["sh","-lc","alembic upgrade head || true"]
+    volumes:
+      - ./alembic:/app/alembic:ro
+      - ./alembic.ini:/app/alembic.ini:ro
 
   seed:
     image: postgres:15-alpine
