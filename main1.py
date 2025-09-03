@@ -186,7 +186,6 @@ async def stripe_webhook(request: Request):
 
     return {"ok": True, "activated": True, "api_key": api_key}
 # -----------------------------------------------------------------------------
-
 # Health / Ready / Metrics
 # -----------------------------------------------------------------------------
 def _table_exists(conn, name: str) -> bool:
@@ -290,82 +289,6 @@ for mod in (
     "routers_screener_mep_v2",
 ):
     _include_router(mod)
-# --- Stripe webhook (public) ---
-from fastapi import Request
-from sqlalchemy import text
-import os, secrets
-
-# If you already have `engine`/`SessionLocal`, reuse them.
-# Otherwise, build a sync engine quickly from DATABASE_URL:
-try:
-    engine  # type: ignore
-except NameError:
-    from sqlalchemy import create_engine
-    url = os.getenv("DATABASE_URL", "postgresql+psycopg2://postgres:postgres@db:5432/market_edge")
-    if "+asyncpg" in url:
-        url = url.replace("+asyncpg", "+psycopg2")
-    engine = create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10)
-
-# Ensure tables exist (idempotent)
-with engine.begin() as conn:
-    conn.execute(text("""
-    CREATE TABLE IF NOT EXISTS subscriptions (
-      id SERIAL PRIMARY KEY,
-      customer_id TEXT NOT NULL,
-      subscription_id TEXT NOT NULL,
-      email TEXT NOT NULL,
-      plan TEXT NOT NULL DEFAULT 'pro',
-      status TEXT NOT NULL DEFAULT 'active',
-      current_period_end BIGINT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """))
-    conn.execute(text("""
-    CREATE TABLE IF NOT EXISTS api_keys (
-      id SERIAL PRIMARY KEY,
-      user_email TEXT NOT NULL,
-      plan TEXT NOT NULL DEFAULT 'pro',
-      key TEXT NOT NULL UNIQUE,
-      active BOOLEAN NOT NULL DEFAULT TRUE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """))
-
-@app.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.json()
-    typ = payload.get("type")
-    obj  = (payload.get("data") or {}).get("object") or {}
-    if typ != "checkout.session.completed":
-        return {"ok": True, "ignored": True}
-
-    email = ((obj.get("customer_details") or {}).get("email")) or ""
-    customer_id = obj.get("customer") or ""
-    subscription_id = obj.get("subscription") or ""
-    plan = (((obj.get("lines") or {}).get("data") or [{}])[0].get("plan") or {}).get("id") or "pro"
-    current_period_end = obj.get("current_period_end")
-
-    if not email or not customer_id or not subscription_id:
-        return {"ok": False, "error": "missing fields"}
-
-    api_key = secrets.token_hex(24)
-
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO subscriptions (customer_id, subscription_id, email, plan, status, current_period_end)
-            VALUES (:customer_id, :subscription_id, :email, :plan, 'active', :cpe)
-            ON CONFLICT DO NOTHING;
-        """), dict(customer_id=customer_id, subscription_id=subscription_id, email=email, plan=plan, cpe=current_period_end))
-
-        conn.execute(text("""
-            INSERT INTO api_keys (user_email, plan, key, active)
-            VALUES (:email, :plan, :key, TRUE)
-            ON CONFLICT (key) DO NOTHING;
-        """), dict(email=email, plan=plan, key=api_key))
-
-    return {"ok": True, "activated": True, "api_key": api_key}
-# --- end webhook ---
-
 # -----------------------------------------------------------------------------
 # Fail-soft middleware (outermost)
 # -----------------------------------------------------------------------------
@@ -394,3 +317,4 @@ class FailSoftMiddleware(BaseHTTPMiddleware):
 app.add_middleware(ObservabilityMiddleware)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(FailSoftMiddleware)
+

@@ -13,7 +13,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    ports: ["5432:5432"]
+    ports:
+      - "5432:5432"
 
   app:
     image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
@@ -22,15 +23,19 @@ services:
       db:
         condition: service_healthy
     environment:
-      # ✅ correct names + webhook public
       APIKEY_ENABLED: "1"
-      API_KEYS: "secret123"
+      APIKEYS: "secret123"  # single source of truth
       APIKEY_PUBLIC: "/docs,/openapi.json,/health,/healthz,/ready,/readyz,/metrics,/stripe/webhook"
       DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
     command: >
       uvicorn main1:app --host 0.0.0.0 --port 8010
-    ports: ["8010:8010"]
+    ports:
+      - "8010:8010"
     restart: unless-stopped
+    volumes:
+      # Ensure the running container uses your updated code & middleware
+      - ./main1.py:/app/main1.py:ro
+      - ./middleware_apikey.py:/app/middleware_apikey.py:ro
 
   migrate:
     image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
@@ -42,7 +47,7 @@ services:
       DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
     command: ["sh","-lc","alembic upgrade head || true"]
     volumes:
-      - ./alembic:/app/alembic:ro
+      - ./migrations:/app/migrations:ro
       - ./alembic.ini:/app/alembic.ini:ro
 
   seed:
@@ -57,3 +62,5 @@ services:
 
 volumes:
   mep_db_data:
+
+
