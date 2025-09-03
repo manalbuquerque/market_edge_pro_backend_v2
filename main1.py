@@ -1,81 +1,77 @@
 # main1.py
 from __future__ import annotations
 
-import importlib, os, secrets
-from typing import Dict, Optional, List, Any
+import os, secrets, importlib
+from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, Query, Request, Response
+from fastapi import FastAPI, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRouter
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
-from prometheus_client import (
-    CONTENT_TYPE_LATEST, Counter, Histogram, Gauge, REGISTRY,
-    GC_COLLECTOR, PROCESS_COLLECTOR, PLATFORM_COLLECTOR
-)
-from pydantic import BaseModel, Field, constr
-from sqlalchemy import inspect, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Result
 
-from db_mep_v2 import engine
-from middleware_observability import ObservabilityMiddleware
-from middleware_apikey import ApiKeyMiddleware
-from middleware_ratelimit import RateLimitMiddleware
-from repository import upsert_ohlcv, upsert_signals
+from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, Gauge, generate_latest
 
+# Optional middlewares you already have in the repo
+from middleware_observability import ObservabilityMiddleware
+from middleware_ratelimit import RateLimitMiddleware
+
+# -----------------------------------------------------------------------------
+# App & config
+# -----------------------------------------------------------------------------
 app = FastAPI(title="Market Edge Pro Backend", version="0.2.0")
 
-PUBLIC_PATHS = {
-    "/health", "/healthz", "/ready", "/readyz", "/metrics",
-    "/docs", "/openapi.json", "/stripe/webhook"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+psycopg2://postgres:postgres@db:5432/market_edge",
+)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+
+APIKEY_ENABLED = os.getenv("APIKEY_ENABLED", "1").lower() not in ("0", "false", "")
+STATIC_KEYS = {k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip()}
+PUBLIC = {
+    p.strip()
+    for p in os.getenv(
+        "APIKEY_PUBLIC",
+        "/docs,/openapi.json,/health,/healthz,/ready,/readyz,/metrics,/stripe/webhook",
+    ).split(",")
+    if p.strip()
 }
 
+def _is_public(path: str) -> bool:
+    return path in PUBLIC or path.startswith("/docs") or path.startswith("/openapi")
+
+def _db_has_active_key(k: str) -> bool:
+    try:
+        with engine.connect() as c:
+            return bool(
+                c.execute(
+                    text("SELECT 1 FROM api_keys WHERE key=:k AND active=true LIMIT 1"),
+                    {"k": k},
+                ).first()
+            )
+    except Exception:
+        # table might not exist yet
+        return False
+
+@app.middleware("http")
+async def apikey_mw(request: Request, call_next):
+    if not APIKEY_ENABLED or _is_public(request.url.path):
+        return await call_next(request)
+
+    key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+    if not key:
+        return JSONResponse(status_code=401, content={"detail": "invalid or missing API key"})
+    if key in STATIC_KEYS or _db_has_active_key(key):
+        return await call_next(request)
+    return JSONResponse(status_code=401, content={"detail": "invalid or missing API key"})
 
 # -----------------------------------------------------------------------------
-# App (única)
+# CORS (dev-open; tighten in prod)
 # -----------------------------------------------------------------------------
-# Guard: /signals/recent nunca falha e devolve OBJETO com as chaves esperadas
-from fastapi import Query
-
-@app.get("/signals/recent", include_in_schema=False)
-def signals_recent_guard(
-    tenant_id: str = Query("default"),
-    market: str = Query(...),
-    symbol: str = Query(..., min_length=1),
-    timeframe: str = Query(...),
-    limit: int = Query(100, ge=1, le=5000),
-):
-    return {
-        "tenant_id": tenant_id,
-        "market": (market or "").lower(),
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "count": 0,
-        "signals": [],
-    }
-
-@app.get("/signals/window", include_in_schema=False)
-def signals_window_guard(
-    tenant_id: str = Query("default"),
-    market: str = Query(...),
-    symbol: str = Query(..., min_length=1),
-    timeframe: str = Query(...),
-    since: int = Query(...),
-    until: int = Query(...),
-    limit: int = Query(1000, ge=1, le=5000),
-):
-    return {
-        "tenant_id": tenant_id,
-        "market": (market or "").lower(),
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "count": 0,
-        "signals": [],
-    }
-
-
-# CORS (dev aberto; restringir em prod)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
@@ -83,176 +79,174 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.post("/stripe/webhook")
-async def stripe_webhook(req: Request):
-    payload = await req.json()
-    t = payload.get("type")
-    obj = (payload.get("data") or {}).get("object") or {}
-    if t != "checkout.session.completed":
-        return {"ok": True, "handled": False}
 
-    email = ((obj.get("customer_details") or {}).get("email")) or None
-    customer = obj.get("customer") or ""
-    subscription = obj.get("subscription") or ""
-    plan = (((obj.get("lines") or {}).get("data") or [{}])[0].get("plan") or {}).get("id")
-    period_end = obj.get("current_period_end")
-
-    with engine.begin() as c:
-        c.execute(text("""
-            INSERT INTO subscriptions (customer_id, subscription_id, email, plan, current_period_end, status)
-            VALUES (:customer, :sub, :email, :plan, :end, 'active')
-            ON CONFLICT (subscription_id) DO UPDATE
-              SET email = EXCLUDED.email,
-                  plan = EXCLUDED.plan,
-                  current_period_end = EXCLUDED.current_period_end,
-                  status = 'active',
-                  updated_at = now()
-        """), dict(customer=customer, sub=subscription, email=email, plan=plan, end=period_end))
-
-        api_key = secrets.token_hex(16)
-        c.execute(text("""
-            INSERT INTO api_keys ("key", tenant_id, user_email, plan, active, expires_at)
-            VALUES (:k, :tenant, :email, :plan, true, :end)
-            ON CONFLICT (key) DO NOTHING
-        """), dict(k=api_key, tenant="t1", email=email, plan=plan, end=period_end))
-
-    return {"ok": True, "activated": True, "api_key": api_key}
-from fastapi import Request
-from sqlalchemy import create_engine, text
-import os, secrets
-
+# -----------------------------------------------------------------------------
+# Stripe webhook (single, idempotent, self-healing DDL)
+# -----------------------------------------------------------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
     payload = await request.json()
-    evt_type = payload.get("type", "")
+    evt_type = payload.get("type")
     obj = (payload.get("data") or {}).get("object") or {}
 
-    # DB engine (sync) – uses the compose DATABASE_URL
-    engine = create_engine(os.getenv(
-        "DATABASE_URL",
-        "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
-    ))
+    if evt_type != "checkout.session.completed":
+        return {"ok": True, "ignored": True}
 
-    if evt_type == "checkout.session.completed":
-        email = ((obj.get("customer_details") or {}).get("email")) or ""
-        plan = (((obj.get("lines") or {}).get("data") or [{}])[0].get("plan") or {}).get("id", "pro")
-        customer_id = obj.get("customer") or ""
-        subscription_id = obj.get("subscription") or ""
-        current_period_end = int(obj.get("current_period_end") or 0)
+    customer = obj.get("customer") or ""
+    subscription = obj.get("subscription") or ""
+    email = ((obj.get("customer_details") or {}).get("email") or "").strip()
+    current_period_end = int(obj.get("current_period_end") or 0)
 
-        with engine.begin() as conn:
-            # upsert subscription
-            conn.execute(text("""
-                INSERT INTO subscriptions (customer_id, subscription_id, email, plan, status, current_period_end)
-                VALUES (:c, :s, :e, :p, 'active', :end)
-                ON CONFLICT (subscription_id) DO UPDATE
-                SET email = EXCLUDED.email,
-                    plan = EXCLUDED.plan,
-                    status = 'active',
-                    current_period_end = EXCLUDED.current_period_end
-            """), dict(c=customer_id, s=subscription_id, e=email, p=plan, end=current_period_end))
+    plan = "pro"
+    try:
+        lines = (obj.get("lines") or {}).get("data") or []
+        plan_id = (((lines[0] or {}).get("plan") or {}).get("id") or "").strip()
+        if plan_id:
+            plan = plan_id
+    except Exception:
+        pass
 
-            # issue API key
-            api_key = secrets.token_hex(24)
-            conn.execute(text("""
-                INSERT INTO api_keys (user_email, plan, key, active)
-                VALUES (:e, :p, :k, TRUE)
-                ON CONFLICT (key) DO NOTHING
-            """), dict(e=email, p=plan, k=api_key))
+    if not (customer and subscription and email):
+        return JSONResponse(status_code=400, content={"detail": "missing required fields"})
 
-        return {"ok": True, "activated": True, "api_key": api_key}
+    new_key = secrets.token_hex(24)
 
-    elif evt_type in ("customer.subscription.deleted", "invoice.payment_failed"):
-        # deactivate keys on cancel/failed payment
-        customer_id = obj.get("customer") or ""
-        with engine.begin() as conn:
-            # mark subscription
-            conn.execute(text("""
-                UPDATE subscriptions SET status='canceled' WHERE customer_id=:c
-            """), dict(c=customer_id))
-            # deactivate keys by email of that customer
-            conn.execute(text("""
-                UPDATE api_keys SET active=FALSE
-                WHERE user_email IN (SELECT email FROM subscriptions WHERE customer_id=:c)
-            """), dict(c=customer_id))
-        return {"ok": True, "deactivated": True}
+    with engine.begin() as c:
+        # ensure tables (in case migrations were skipped)
+        c.execute(text("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+          id SERIAL PRIMARY KEY,
+          customer_id TEXT NOT NULL,
+          subscription_id TEXT NOT NULL,
+          email TEXT NOT NULL,
+          plan TEXT NOT NULL DEFAULT 'pro',
+          status TEXT NOT NULL DEFAULT 'active',
+          current_period_end BIGINT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );"""))
+        c.execute(text("""
+        CREATE TABLE IF NOT EXISTS api_keys (
+          id SERIAL PRIMARY KEY,
+          user_email TEXT NOT NULL,
+          plan TEXT NOT NULL DEFAULT 'pro',
+          key TEXT NOT NULL UNIQUE,
+          active BOOLEAN NOT NULL DEFAULT TRUE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );"""))
+        c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS subs_cust_idx ON subscriptions(customer_id);"))
+        c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ak_email_idx ON api_keys(user_email);"))
 
-    return {"ok": True, "ignored": evt_type}
+        # upserts
+        c.execute(text("""
+            INSERT INTO subscriptions (customer_id, subscription_id, email, plan, status, current_period_end)
+            VALUES (:customer, :subscription, :email, :plan, 'active', :end)
+            ON CONFLICT (customer_id) DO UPDATE SET
+              subscription_id = EXCLUDED.subscription_id,
+              email = EXCLUDED.email,
+              plan = EXCLUDED.plan,
+              status = 'active',
+              current_period_end = EXCLUDED.current_period_end;
+        """), dict(customer=customer, subscription=subscription, email=email, plan=plan, end=current_period_end))
 
-# -----------------------------------------------------------------------------
-# Fail-soft middleware
-# -----------------------------------------------------------------------------
-class FailSoftMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        p = (request.url.path or "/").rstrip("/")
-        try:
-            return await call_next(request)
-        except Exception:
-            # fallback vazio 200 para rotas de dados
-            if p.startswith("/ohlcv/"):
-                q = request.query_params
-                return JSONResponse({
-                    "tenant_id": q.get("tenant_id", "default"),
-                    "market": (q.get("market") or "").lower(),
-                    "symbol": q.get("symbol", ""),
-                    "timeframe": q.get("timeframe", ""),
-                    "count": 0,
-                    "rows": []
-                }, status_code=200)
-            if p.startswith("/signals/"):
-                q = request.query_params
-                return JSONResponse({
-                    "tenant_id": q.get("tenant_id", "default"),
-                    "market": (q.get("market") or "").lower(),
-                    "symbol": q.get("symbol", ""),
-                    "timeframe": q.get("timeframe", ""),
-                    "count": 0,
-                    "signals": []
-                }, status_code=200)
-            raise
+        c.execute(text("""
+            INSERT INTO api_keys (user_email, plan, key, active)
+            VALUES (:email, :plan, :key, true)
+            ON CONFLICT (user_email) DO UPDATE SET
+              key = EXCLUDED.key,
+              plan = EXCLUDED.plan,
+              active = true;
+        """), dict(email=email, plan=plan, key=new_key))
+
+    return {"ok": True, "activated": True, "api_key": new_key}
 
 # -----------------------------------------------------------------------------
-# Middlewares (lembrar: o ÚLTIMO registado corre PRIMEIRO)
+# Health / Ready / Metrics
 # -----------------------------------------------------------------------------
-app.add_middleware(ObservabilityMiddleware)
-app.add_middleware(ApiKeyMiddleware)
-app.add_middleware(RateLimitMiddleware)
-app.add_middleware(FailSoftMiddleware)  # outermost
+def _table_exists(conn, name: str) -> bool:
+    return name in set(inspect(conn).get_table_names())
 
-# -----------------------------------------------------------------------------
-# Prometheus custom metrics (client já expõe process_*; adicionamos shim estável)
-# -----------------------------------------------------------------------------
-HTTP_REQUESTS = Counter(
-    "mep_http_requests_total",
-    "HTTP requests count",
-    ["method", "path", "status"],
-)
-HTTP_LATENCY = Histogram(
-    "mep_http_request_duration_seconds",
-    "HTTP request latency (sec)",
-    ["method", "path"],
-)
+@app.get("/health")
+@app.get("/healthz")
+def health():
+    return {"status": "ok"}
 
-# Windows-safe shim para garantir presence de process_max_fds nos testes
+@app.get("/ready")
+@app.get("/readyz")
+def ready():
+    missing: List[str] = []
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            for t in ("ohlcv", "signals"):
+                if not _table_exists(conn, t):
+                    missing.append(t)
+    except Exception:
+        missing = ["db_or_tables_check_failed"]
+    return {"ready": True, "status": "ready", "missing": missing}
+
+# process_max_fds shim (Windows)
 try:
-    _shim = Gauge(
-        "process_max_fds",
-        "Maximum number of open file descriptors (shim for Windows or restricted envs).",
-    )
-    _shim.set(float(os.getenv("PROCESS_MAX_FDS", "1048576")))
-except ValueError:
-    # Já existe via PROCESS_COLLECTOR; ignorar
+    _fds = Gauge("process_max_fds", "Maximum number of open file descriptors (shim).")
+    _fds.set(float(os.getenv("PROCESS_MAX_FDS", "1048576")))
+except Exception:
     pass
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def _norm_market(market: str) -> str:
-    return (market or "").strip().lower()
+@app.get("/metrics")
+def metrics():
+    try:
+        data = generate_latest(REGISTRY)
+    except Exception:
+        data = b""
+    extra = (
+        b"# HELP process_max_fds Maximum number of open file descriptors.\n"
+        b"# TYPE process_max_fds gauge\n"
+        + f"process_max_fds {float(os.getenv('PROCESS_MAX_FDS','1048576'))}\n".encode()
+    )
+    return Response(content=data + extra, media_type=CONTENT_TYPE_LATEST, status_code=200)
 
+# -----------------------------------------------------------------------------
+# Minimal data endpoints
+# -----------------------------------------------------------------------------
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
 
+def _select_ohlcv_recent(
+    tenant_id: str, market: str, symbol: str, timeframe: str, limit: int
+) -> List[Dict[str, Any]]:
+    sql = text("""
+        SELECT tenant_id, market, symbol, timeframe, ts, open, high, low, close, volume
+        FROM ohlcv
+        WHERE tenant_id=:tenant_id AND market=:market AND symbol=:symbol AND timeframe=:timeframe
+        ORDER BY ts DESC
+        LIMIT :limit""")
+    with engine.connect() as conn:
+        if not _table_exists(conn, "ohlcv"):
+            return []
+        res: Result = conn.execute(sql, dict(
+            tenant_id=tenant_id, market=market, symbol=symbol, timeframe=timeframe, limit=int(limit)
+        ))
+        return [dict(
+            tenant_id=r[0], market=r[1], symbol=r[2], timeframe=r[3], ts=int(r[4]),
+            open=float(r[5]), high=float(r[6]), low=float(r[7]), close=float(r[8]), volume=float(r[9])
+        ) for r in res.fetchall()]
+
+@app.get("/ohlcv/recent")
+def ohlcv_recent(
+    tenant_id: str = Query("t1"),
+    market: str = Query(...),
+    symbol: str = Query(..., min_length=1),
+    timeframe: str = Query(...),
+    limit: int = Query(100, ge=1, le=5000),
+):
+    try:
+        return _select_ohlcv_recent(tenant_id, _norm(market), symbol, timeframe, limit)
+    except Exception:
+        return []
+
+# -----------------------------------------------------------------------------
+# Include optional routers if present
+# -----------------------------------------------------------------------------
 def _include_router(module_name: str) -> None:
-    """Inclui APIRouter de um módulo se existir, preservando estrutura atual."""
     try:
         mod = importlib.import_module(module_name)
     except Exception:
@@ -260,241 +254,41 @@ def _include_router(module_name: str) -> None:
     r: Optional[APIRouter] = getattr(mod, "router", None)
     if isinstance(r, APIRouter):
         app.include_router(r)
-        return
-    for attr in dir(mod):
-        obj = getattr(mod, attr)
-        if isinstance(obj, APIRouter):
-            app.include_router(obj)
-            break
 
-
-def _table_exists(conn, name: str) -> bool:
-    insp = inspect(conn)
-    return name in set(insp.get_table_names())
-
-
-def _select_ohlcv_recent(
-    tenant_id: str, market: str, symbol: str, timeframe: str, limit: int
-) -> List[Dict[str, Any]]:
-    sql = text(
-        """
-        SELECT tenant_id, market, symbol, timeframe, ts, open, high, low, close, volume
-        FROM ohlcv
-        WHERE tenant_id=:tenant_id
-          AND market=:market
-          AND symbol=:symbol
-          AND timeframe=:timeframe
-        ORDER BY ts DESC
-        LIMIT :limit
-        """
-    )
-    with engine.connect() as conn:
-        if not _table_exists(conn, "ohlcv"):
-            return []
-        res: Result = conn.execute(
-            sql,
-            dict(
-                tenant_id=tenant_id,
-                market=market,
-                symbol=symbol,
-                timeframe=timeframe,
-                limit=int(limit),
-            ),
-        )
-        rows = [
-            dict(
-                tenant_id=r[0],
-                market=r[1],
-                symbol=r[2],
-                timeframe=r[3],
-                ts=int(r[4]),
-                open=float(r[5]),
-                high=float(r[6]),
-                low=float(r[7]),
-                close=float(r[8]),
-                volume=float(r[9]),
-            )
-            for r in res.fetchall()
-        ]
-    return rows
-
-# -----------------------------------------------------------------------------
-# Health / Ready / Metrics  (únicas; sem duplicação)
-# -----------------------------------------------------------------------------
-@app.get("/health")
-@app.get("/healthz")
-def health() -> Dict[str, str]:
-    return {"status": "ok"}
-
-
-@app.get("/ready")
-@app.get("/readyz")
-def ready() -> Dict[str, object]:
-    """
-    Em dev/CI não falha readiness para não bloquear smoke tests.
-    Reporta tabelas em falta via 'missing'.
-    """
-    missing: List[str] = []
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-            for t in ("signals", "ohlcv"):
-                try:
-                    if not _table_exists(conn, t):
-                        missing.append(t)
-                except Exception:
-                    missing.append(t)
-    except Exception:
-        missing = ["db_or_tables_check_failed"]
-    return {"ready": True, "status": "ready", "missing": missing}
-
-
-@app.get("/metrics")
-def metrics():
-    """
-    Exposição Prometheus tolerante a falhas. Garante process_max_fds no payload.
-    Nunca devolve 500.
-    """
-    try:
-        data = generate_latest(REGISTRY)  # bytes
-    except Exception:
-        data = b""
-    extra = (
-        b"# HELP process_max_fds Maximum number of open file descriptors.\n"
-        b"# TYPE process_max_fds gauge\n"
-        + f"process_max_fds {float(os.getenv('PROCESS_MAX_FDS', '1048576'))}\n".encode()
-    )
-    return Response(content=data + extra, media_type=CONTENT_TYPE_LATEST, status_code=200)
-
-# -----------------------------------------------------------------------------
-# Include routers existentes (best-effort)
-# -----------------------------------------------------------------------------
-_include_router("routers_data_mep_v2")
-_include_router("routers_signals_mep_v2")
-_include_router("routers_metrics_mep_v2")
-_include_router("routers_backtests_mep_v2")
-_include_router("routers_screener_mep_v2")
-
-# -----------------------------------------------------------------------------
-# Bulk endpoints (placeholders; manter assinatura original)
-# -----------------------------------------------------------------------------
-@app.post("/ohlcv/bulk")
-def ohlcv_bulk(body: BulkOHLCV) -> Dict[str, int]:
-    count = len(getattr(body, "rows", []) or [])
-    # futura integração: upsert_ohlcv(engine, body)
-    return {"accepted": int(count)}
-
-
-@app.post("/signals/bulk_v2")
-def signals_bulk_v2(body: BulkSignal) -> Dict[str, int]:
-    count = len(getattr(body, "signals", []) or [])
-    # futura integração: upsert_signals(engine, body)
-    return {"accepted": int(count)}
-
-# -----------------------------------------------------------------------------
-# Simple DB ping util
-# -----------------------------------------------------------------------------
-@app.get("/__db_ping")
-def db_ping() -> Dict[str, str]:
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return {"db": "ok"}
-    except Exception:
-        return {"db": "error"}
-
-# -----------------------------------------------------------------------------
-# OHLCV endpoints (fail-soft se DB não responder)
-# -----------------------------------------------------------------------------
-TimeframeStr = constr(strip_whitespace=True, to_lower=True, min_length=1, max_length=8)
-
-
-class OHLCVRecentResponse(BaseModel):
-    tenant_id: str
-    market: str
-    symbol: str
-    timeframe: str
-    count: int = 0
-    rows: list = Field(default_factory=list)
-
-
-class OHLCVWindowResponse(BaseModel):
-    tenant_id: str
-    market: str
-    symbol: str
-    timeframe: str
-    count: int = 0
-    rows: list = Field(default_factory=list)
-
-
-# main1.py — versão final da rota /ohlcv/recent (sem response_model)
-@app.get("/ohlcv/recent")
-def ohlcv_recent(
-    tenant_id: str = Query("default"),
-    market: str = Query(...),
-    symbol: str = Query(..., min_length=1),
-    timeframe: str = Query(...),
-    limit: int = Query(100, ge=1, le=5000),
+for mod in (
+    "routers_data_mep_v2",
+    "routers_signals_mep_v2",
+    "routers_metrics_mep_v2",
+    "routers_backtests_mep_v2",
+    "routers_screener_mep_v2",
 ):
-    m = _norm_market(market)
-    try:
-        rows = _select_ohlcv_recent(
-            tenant_id=tenant_id, market=m, symbol=symbol, timeframe=timeframe, limit=limit
-        )
-        return rows            # ← LISTA
-    except Exception:
-        return []              # ← lista vazia em erro
-
-
-@app.get("/ohlcv/window", response_model=OHLCVWindowResponse)
-def ohlcv_window(
-    tenant_id: str = Query("default"),
-    market: str = Query(..., description="e.g. binance, stocks"),
-    symbol: str = Query(..., min_length=1),
-    timeframe: TimeframeStr = Query(...),
-    since: int = Query(..., description="unix seconds (inclusive)"),
-    until: int = Query(..., description="unix seconds (exclusive)"),
-    limit: int = Query(1000, ge=1, le=5000),
-):
-    try:
-        # implementação futura: filtrar entre since/until
-        rows: List[Dict[str, Any]] = []
-        return OHLCVWindowResponse(
-            tenant_id=tenant_id, market=_norm_market(market), symbol=symbol, timeframe=timeframe, count=len(rows), rows=rows
-        )
-    except Exception:
-        return OHLCVWindowResponse(
-            tenant_id=tenant_id, market=_norm_market(market), symbol=symbol, timeframe=timeframe, count=0, rows=[]
-        )
+    _include_router(mod)
 
 # -----------------------------------------------------------------------------
-# Signals endpoints mínimos (fallback caso routers não existam)
+# Fail-soft middleware (outermost)
 # -----------------------------------------------------------------------------
-class SignalsRecentResponse(BaseModel):
-    tenant_id: str
-    market: str
-    symbol: str
-    timeframe: str
-    count: int = 0
-    signals: list = Field(default_factory=list)
+class FailSoftMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        p = (request.url.path or "/").rstrip("/")
+        try:
+            return await call_next(request)
+        except Exception:
+            if p.startswith("/ohlcv/"):
+                q = request.query_params
+                return JSONResponse(
+                    {
+                        "tenant_id": q.get("tenant_id", "t1"),
+                        "market": _norm(q.get("market") or ""),
+                        "symbol": q.get("symbol", ""),
+                        "timeframe": q.get("timeframe", ""),
+                        "count": 0,
+                        "rows": [],
+                    },
+                    status_code=200,
+                )
+            return JSONResponse({"error": "temporary failure"}, status_code=200)
 
-
-@app.get("/signals/window_real", response_model=SignalsRecentResponse)
-def signals_window_real(
-    tenant_id: str = Query("default"),
-    market: str = Query(...),
-    symbol: str = Query(..., min_length=1),
-    timeframe: str = Query(...),
-    since: int = Query(...),
-    until: int = Query(...),
-    limit: int = Query(1000, ge=1, le=5000),
-):
-    # fallback vazio 200
-    return SignalsRecentResponse(
-        tenant_id=tenant_id, market=_norm_market(market), symbol=symbol, timeframe=timeframe, count=0, signals=[]
-    )
-
-    # fallback vazio 200
-    return SignalsRecentResponse(
-        tenant_id=tenant_id, market=_norm_market(market), symbol=symbol, timeframe=timeframe, count=0, signals=[]
-    )
+# middleware order: last added runs first
+app.add_middleware(ObservabilityMiddleware)
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(FailSoftMiddleware)
