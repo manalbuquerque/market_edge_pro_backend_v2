@@ -117,6 +117,67 @@ async def stripe_webhook(req: Request):
         """), dict(k=api_key, tenant="t1", email=email, plan=plan, end=period_end))
 
     return {"ok": True, "activated": True, "api_key": api_key}
+from fastapi import Request
+from sqlalchemy import create_engine, text
+import os, secrets
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.json()
+    evt_type = payload.get("type", "")
+    obj = (payload.get("data") or {}).get("object") or {}
+
+    # DB engine (sync) – uses the compose DATABASE_URL
+    engine = create_engine(os.getenv(
+        "DATABASE_URL",
+        "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
+    ))
+
+    if evt_type == "checkout.session.completed":
+        email = ((obj.get("customer_details") or {}).get("email")) or ""
+        plan = (((obj.get("lines") or {}).get("data") or [{}])[0].get("plan") or {}).get("id", "pro")
+        customer_id = obj.get("customer") or ""
+        subscription_id = obj.get("subscription") or ""
+        current_period_end = int(obj.get("current_period_end") or 0)
+
+        with engine.begin() as conn:
+            # upsert subscription
+            conn.execute(text("""
+                INSERT INTO subscriptions (customer_id, subscription_id, email, plan, status, current_period_end)
+                VALUES (:c, :s, :e, :p, 'active', :end)
+                ON CONFLICT (subscription_id) DO UPDATE
+                SET email = EXCLUDED.email,
+                    plan = EXCLUDED.plan,
+                    status = 'active',
+                    current_period_end = EXCLUDED.current_period_end
+            """), dict(c=customer_id, s=subscription_id, e=email, p=plan, end=current_period_end))
+
+            # issue API key
+            api_key = secrets.token_hex(24)
+            conn.execute(text("""
+                INSERT INTO api_keys (user_email, plan, key, active)
+                VALUES (:e, :p, :k, TRUE)
+                ON CONFLICT (key) DO NOTHING
+            """), dict(e=email, p=plan, k=api_key))
+
+        return {"ok": True, "activated": True, "api_key": api_key}
+
+    elif evt_type in ("customer.subscription.deleted", "invoice.payment_failed"):
+        # deactivate keys on cancel/failed payment
+        customer_id = obj.get("customer") or ""
+        with engine.begin() as conn:
+            # mark subscription
+            conn.execute(text("""
+                UPDATE subscriptions SET status='canceled' WHERE customer_id=:c
+            """), dict(c=customer_id))
+            # deactivate keys by email of that customer
+            conn.execute(text("""
+                UPDATE api_keys SET active=FALSE
+                WHERE user_email IN (SELECT email FROM subscriptions WHERE customer_id=:c)
+            """), dict(c=customer_id))
+        return {"ok": True, "deactivated": True}
+
+    return {"ok": True, "ignored": evt_type}
 
 # -----------------------------------------------------------------------------
 # Fail-soft middleware
