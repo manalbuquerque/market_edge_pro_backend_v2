@@ -4,6 +4,8 @@ from __future__ import annotations
 import importlib
 import os
 from typing import Dict, Optional, List, Any
+from routes_billing import router as billing_router
+app.include_router(billing_router, tags=["billing"])
 
 from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
