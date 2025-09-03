@@ -3,13 +3,13 @@ services:
     image: postgres:15-alpine
     container_name: mep-db
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-market_edge}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: market_edge
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     volumes:
       - mep_db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-market_edge} || exit 1"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d market_edge || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -17,32 +17,41 @@ services:
       - "5432:5432"
 
   app:
-    build: .
-    image: mep-app:dev
+    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
     container_name: mep-app
     depends_on:
       db:
         condition: service_healthy
     environment:
-      APIKEY_ENABLED: ${APIKEY_ENABLED:-1}
-      API_KEYS: ${API_KEYS:-secret123}
-      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://postgres:postgres@db:5432/market_edge}
-      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_dev}
+      # API key system
+      APIKEY_ENABLED: "1"
+      API_KEYS: "secret123"
+      # make webhook public (no API key required)
+      APIKEY_PUBLIC: "/stripe/webhook"
+      # DB (service hostname is 'db')
+      DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
+      # optional: if you set a real Stripe signing secret later
+      # STRIPE_WEBHOOK_SECRET: "whsec_xxx"
     command: >
-      uvicorn main1:app --host 0.0.0.0 --port 8010
+      uvicorn main1:app
+      --host 0.0.0.0
+      --port 8010
     ports:
       - "8010:8010"
     restart: unless-stopped
 
   migrate:
-    build: .
-    image: mep-app:dev
+    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
     container_name: mep-migrate
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://postgres:postgres@db:5432/market_edge}
+      DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
+    # use YOUR local migrations + ini (so env.py honors DATABASE_URL)
+    volumes:
+      - ./migrations:/app/migrations:ro
+      - ./alembic.ini:/app/alembic.ini:ro
     command: ["sh","-lc","alembic upgrade head || true"]
 
   seed:
