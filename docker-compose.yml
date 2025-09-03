@@ -3,30 +3,47 @@ services:
     image: postgres:15-alpine
     container_name: mep-db
     environment:
-      POSTGRES_DB: market_edge
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    volumes: [mep_db_data:/var/lib/postgresql/data]
+      POSTGRES_DB: ${POSTGRES_DB:-market_edge}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - mep_db_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d market_edge || exit 1"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-market_edge} || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 30
-    # optional on Windows host; keep if you want local psql access:
-    ports: ["5432:5432"]
+    ports:
+      - "5432:5432"
+
+  app:
+    build: .
+    image: mep-app:dev
+    container_name: mep-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APIKEY_ENABLED: ${APIKEY_ENABLED:-1}
+      API_KEYS: ${API_KEYS:-secret123}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://postgres:postgres@db:5432/market_edge}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_dev}
+    command: >
+      uvicorn main1:app --host 0.0.0.0 --port 8010
+    ports:
+      - "8010:8010"
+    restart: unless-stopped
 
   migrate:
-    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:latest
+    build: .
+    image: mep-app:dev
     container_name: mep-migrate
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/market_edge
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://postgres:postgres@db:5432/market_edge}
     command: ["sh","-lc","alembic upgrade head || true"]
-    volumes:
-      - ./alembic:/app/alembic:ro
-      - ./alembic.ini:/app/alembic.ini:ro
 
   seed:
     image: postgres:15-alpine
@@ -37,32 +54,6 @@ services:
     volumes:
       - ./seeds:/seeds:ro
     command: ["sh","-lc","psql postgresql://postgres:postgres@db:5432/market_edge -f /seeds/ohlcv_seed.sql || true"]
-
-  app:
-    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:latest
-    container_name: mep-app
-    depends_on:
-      db:
-        condition: service_healthy
-      migrate:
-        condition: service_completed_successfully
-      seed:
-        condition: service_completed_successfully
-    environment:
-      APIKEY_ENABLED: "1"
-      API_KEYS: "secret123"
-      APIKEY_PUBLIC_PATHS: "/stripe/webhook"
-      DATABASE_URL: "postgresql+psycopg2://postgres:postgres@db:5432/market_edge"
-    command: >-
-      uvicorn main1:app --host 0.0.0.0 --port 8010
-    ports: ["8010:8010"]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8010/health >/dev/null 2>&1 || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-      start_period: 10s
 
 volumes:
   mep_db_data:
