@@ -16,7 +16,7 @@ services:
     ports: ["5432:5432"]
 
   migrate:
-    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
+    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:latest
     container_name: mep-migrate
     depends_on:
       db:
@@ -39,7 +39,7 @@ services:
     command: ["sh","-lc","psql postgresql://postgres:postgres@db:5432/market_edge -f /seeds/ohlcv_seed.sql || true"]
 
   app:
-    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:v0.2.5
+    image: ghcr.io/manalbuquerque/market_edge_pro_backend_v2:latest
     container_name: mep-app
     depends_on:
       db:
