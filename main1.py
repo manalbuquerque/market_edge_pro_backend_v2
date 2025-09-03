@@ -81,7 +81,7 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Stripe webhook (single, idempotent, self-healing DDL)
+# Stripe webhook (idempotent; correct uniques; no key rotation)
 # -----------------------------------------------------------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
@@ -92,27 +92,19 @@ async def stripe_webhook(request: Request):
     if evt_type != "checkout.session.completed":
         return {"ok": True, "ignored": True}
 
-    customer = obj.get("customer") or ""
-    subscription = obj.get("subscription") or ""
-    email = ((obj.get("customer_details") or {}).get("email") or "").strip()
-    current_period_end = int(obj.get("current_period_end") or 0)
+    customer = (obj.get("customer") or "").strip()
+    sub_id = (obj.get("subscription") or "").strip()
+    email = ((obj.get("customer_details") or {}).get("email") or "").strip().lower()
+    cpe = int(obj.get("current_period_end") or 0)
 
-    plan = "pro"
-    try:
-        lines = (obj.get("lines") or {}).get("data") or []
-        plan_id = (((lines[0] or {}).get("plan") or {}).get("id") or "").strip()
-        if plan_id:
-            plan = plan_id
-    except Exception:
-        pass
+    lines = (obj.get("lines") or {}).get("data") or []
+    plan = ((((lines[0] or {}).get("plan") or {}).get("id")) or "pro").strip() if lines else "pro"
 
-    if not (customer and subscription and email):
-        return JSONResponse(status_code=400, content={"detail": "missing required fields"})
-
-    new_key = secrets.token_hex(24)
+    if not (email and sub_id):
+        return JSONResponse(status_code=400, content={"detail": "missing email/subscription"})
 
     with engine.begin() as c:
-        # ensure tables (in case migrations were skipped)
+        # Ensure tables exist (safe if migrations were skipped)
         c.execute(text("""
         CREATE TABLE IF NOT EXISTS subscriptions (
           id SERIAL PRIMARY KEY,
@@ -123,7 +115,8 @@ async def stripe_webhook(request: Request):
           status TEXT NOT NULL DEFAULT 'active',
           current_period_end BIGINT,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );"""))
+        );
+        """))
         c.execute(text("""
         CREATE TABLE IF NOT EXISTS api_keys (
           id SERIAL PRIMARY KEY,
@@ -132,34 +125,68 @@ async def stripe_webhook(request: Request):
           key TEXT NOT NULL UNIQUE,
           active BOOLEAN NOT NULL DEFAULT TRUE,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );"""))
-        c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS subs_cust_idx ON subscriptions(customer_id);"))
-        c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ak_email_idx ON api_keys(user_email);"))
+        );
+        """))
 
-        # upserts
+        # Correct unique constraints (once)
+        c.execute(text("""
+        DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='uq_subscriptions_subscription_id') THEN
+            ALTER TABLE subscriptions ADD CONSTRAINT uq_subscriptions_subscription_id UNIQUE (subscription_id);
+          END IF;
+        END$$;
+        """))
+        c.execute(text("""
+        DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='uq_api_keys_user_plan') THEN
+            ALTER TABLE api_keys ADD CONSTRAINT uq_api_keys_user_plan UNIQUE (user_email, plan);
+          END IF;
+        END$$;
+        """))
+        c.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_api_keys_key ON api_keys(key);"))
+
+        # Upsert subscription by subscription_id (idempotent)
         c.execute(text("""
             INSERT INTO subscriptions (customer_id, subscription_id, email, plan, status, current_period_end)
-            VALUES (:customer, :subscription, :email, :plan, 'active', :end)
-            ON CONFLICT (customer_id) DO UPDATE SET
-              subscription_id = EXCLUDED.subscription_id,
-              email = EXCLUDED.email,
-              plan = EXCLUDED.plan,
-              status = 'active',
-              current_period_end = EXCLUDED.current_period_end;
-        """), dict(customer=customer, subscription=subscription, email=email, plan=plan, end=current_period_end))
+            VALUES (:cust, :sub, :email, :plan, 'active', :cpe)
+            ON CONFLICT (subscription_id) DO UPDATE
+               SET customer_id = EXCLUDED.customer_id,
+                   email       = EXCLUDED.email,
+                   plan        = EXCLUDED.plan,
+                   status      = 'active',
+                   current_period_end = EXCLUDED.current_period_end;
+        """), {"cust": customer, "sub": sub_id, "email": email, "plan": plan, "cpe": cpe})
 
-        c.execute(text("""
-            INSERT INTO api_keys (user_email, plan, key, active)
-            VALUES (:email, :plan, :key, true)
-            ON CONFLICT (user_email) DO UPDATE SET
-              key = EXCLUDED.key,
-              plan = EXCLUDED.plan,
-              active = true;
-        """), dict(email=email, plan=plan, key=new_key))
+        # One API key per (email, plan) — do NOT rotate if it already exists
+        row = c.execute(text("""
+            UPDATE api_keys SET active=TRUE
+             WHERE user_email=:email AND plan=:plan
+         RETURNING key;
+        """), {"email": email, "plan": plan}).fetchone()
 
-    return {"ok": True, "activated": True, "api_key": new_key}
+        if row:
+            api_key = row[0]
+        else:
+            candidate = secrets.token_hex(32)
+            ins = c.execute(text("""
+                INSERT INTO api_keys (user_email, plan, key, active)
+                VALUES (:email, :plan, :key, TRUE)
+                ON CONFLICT (user_email, plan) DO NOTHING
+             RETURNING key;
+            """), {"email": email, "plan": plan, "key": candidate}).fetchone()
 
+            if ins:
+                api_key = ins[0]
+            else:
+                api_key = c.execute(text("""
+                    SELECT key FROM api_keys WHERE user_email=:email AND plan=:plan;
+                """), {"email": email, "plan": plan}).scalar_one()
+
+    return {"ok": True, "activated": True, "api_key": api_key}
 # -----------------------------------------------------------------------------
+
 # Health / Ready / Metrics
 # -----------------------------------------------------------------------------
 def _table_exists(conn, name: str) -> bool:
@@ -263,6 +290,81 @@ for mod in (
     "routers_screener_mep_v2",
 ):
     _include_router(mod)
+# --- Stripe webhook (public) ---
+from fastapi import Request
+from sqlalchemy import text
+import os, secrets
+
+# If you already have `engine`/`SessionLocal`, reuse them.
+# Otherwise, build a sync engine quickly from DATABASE_URL:
+try:
+    engine  # type: ignore
+except NameError:
+    from sqlalchemy import create_engine
+    url = os.getenv("DATABASE_URL", "postgresql+psycopg2://postgres:postgres@db:5432/market_edge")
+    if "+asyncpg" in url:
+        url = url.replace("+asyncpg", "+psycopg2")
+    engine = create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=10)
+
+# Ensure tables exist (idempotent)
+with engine.begin() as conn:
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id SERIAL PRIMARY KEY,
+      customer_id TEXT NOT NULL,
+      subscription_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      plan TEXT NOT NULL DEFAULT 'pro',
+      status TEXT NOT NULL DEFAULT 'active',
+      current_period_end BIGINT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """))
+    conn.execute(text("""
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id SERIAL PRIMARY KEY,
+      user_email TEXT NOT NULL,
+      plan TEXT NOT NULL DEFAULT 'pro',
+      key TEXT NOT NULL UNIQUE,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """))
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.json()
+    typ = payload.get("type")
+    obj  = (payload.get("data") or {}).get("object") or {}
+    if typ != "checkout.session.completed":
+        return {"ok": True, "ignored": True}
+
+    email = ((obj.get("customer_details") or {}).get("email")) or ""
+    customer_id = obj.get("customer") or ""
+    subscription_id = obj.get("subscription") or ""
+    plan = (((obj.get("lines") or {}).get("data") or [{}])[0].get("plan") or {}).get("id") or "pro"
+    current_period_end = obj.get("current_period_end")
+
+    if not email or not customer_id or not subscription_id:
+        return {"ok": False, "error": "missing fields"}
+
+    api_key = secrets.token_hex(24)
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO subscriptions (customer_id, subscription_id, email, plan, status, current_period_end)
+            VALUES (:customer_id, :subscription_id, :email, :plan, 'active', :cpe)
+            ON CONFLICT DO NOTHING;
+        """), dict(customer_id=customer_id, subscription_id=subscription_id, email=email, plan=plan, cpe=current_period_end))
+
+        conn.execute(text("""
+            INSERT INTO api_keys (user_email, plan, key, active)
+            VALUES (:email, :plan, :key, TRUE)
+            ON CONFLICT (key) DO NOTHING;
+        """), dict(email=email, plan=plan, key=api_key))
+
+    return {"ok": True, "activated": True, "api_key": api_key}
+# --- end webhook ---
 
 # -----------------------------------------------------------------------------
 # Fail-soft middleware (outermost)
