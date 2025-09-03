@@ -34,6 +34,53 @@ from middleware_apikey import ApiKeyMiddleware
 from middleware_ratelimit import RateLimitMiddleware
 from repository import upsert_ohlcv, upsert_signals
 from schemas import BulkOHLCV, BulkSignal
+from fastapi import Request
+from sqlalchemy import text
+import secrets
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(req: Request):
+    payload = await req.json()
+    t = payload.get("type")
+    obj = (payload.get("data") or {}).get("object") or {}
+
+    if t != "checkout.session.completed":
+        return {"ok": True, "handled": False}
+
+    email = ((obj.get("customer_details") or {}).get("email")) or None
+    customer = obj.get("customer") or ""
+    subscription = obj.get("subscription") or ""
+    plan = (((obj.get("lines") or {}).get("data") or [{}])[0].get("plan") or {}).get("id")
+    period_end = obj.get("current_period_end")  # epoch seconds
+
+    # upsert subscription
+    with engine.begin() as c:
+        c.execute(
+            text("""
+            INSERT INTO subscriptions (customer_id, subscription_id, email, plan, current_period_end, status)
+            VALUES (:customer, :sub, :email, :plan, :end, 'active')
+            ON CONFLICT (subscription_id) DO UPDATE
+              SET email = EXCLUDED.email,
+                  plan = EXCLUDED.plan,
+                  current_period_end = EXCLUDED.current_period_end,
+                  status = 'active',
+                  updated_at = now()
+            """),
+            dict(customer=customer, sub=subscription, email=email, plan=plan, end=period_end),
+        )
+
+        # issue an API key for this email (idempotent-ish)
+        api_key = secrets.token_hex(16)
+        c.execute(
+            text("""
+            INSERT INTO api_keys ("key", tenant_id, user_email, plan, active, expires_at)
+            VALUES (:k, :tenant, :email, :plan, true, :end)
+            ON CONFLICT (key) DO NOTHING
+            """),
+            dict(k=api_key, tenant="t1", email=email, plan=plan, end=period_end),
+        )
+
+    return {"ok": True, "activated": True, "api_key": api_key}
 
 # -----------------------------------------------------------------------------
 # App (única)
